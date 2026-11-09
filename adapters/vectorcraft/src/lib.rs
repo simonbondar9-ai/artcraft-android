@@ -20,6 +20,7 @@ use jni::{
 };
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -36,8 +37,92 @@ mod system_fonts;
 const SAF_BRIDGE_MARKER: &str = "ARTCRAFT_VECTORCRAFT_SAF_BRIDGE_V1";
 
 /// Emitted at startup so a device log (and the packaged `.so` strings) can confirm this shell —
-/// including the Android modifier-key fix and immersive fullscreen — is the one that is running.
-const ANDROID_SHELL_MARKER: &str = "ARTCRAFT_VECTORCRAFT_ANDROID_SHELL_V2_MODIFIERS_FULLSCREEN";
+/// including the Android modifier-key fix, immersive fullscreen and the Android 9 startup
+/// diagnostics/GLES fallback — is the one that is running.
+const ANDROID_SHELL_MARKER: &str = "ARTCRAFT_VECTORCRAFT_ANDROID_SHELL_V3_ANDROID9_DIAG";
+
+/// Where the startup diagnostics are appended. The file lives in the app's external files
+/// directory, so it can be read over MTP (`Android/data/com.artcraft.vectorcraft/files/`) without
+/// `adb` after the app has run (or crashed).
+static STARTUP_LOG: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+
+/// Record one startup step in logcat *and* in the startup log file, so a launch that dies before
+/// the first frame still leaves a readable trace on the device.
+fn note(message: &str) {
+    log::info!("{message}");
+    let Some(Some(path)) = STARTUP_LOG.get() else {
+        return;
+    };
+    let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) else {
+        return;
+    };
+    let _ = file.write_all(message.as_bytes());
+    let _ = file.write_all(b"\n");
+    let _ = file.flush();
+}
+
+/// Prepare the startup log and route panics (message, location, backtrace) into it. Called as the
+/// first thing in [`android_main`], before any graphics or app code can fail.
+fn install_startup_log(app: &AndroidApp) {
+    let path = app_data_dir(app).map(|base| base.join("vectorcraft-startup.log"));
+    if let Some(dir) = path.as_ref().and_then(|path| path.parent()) {
+        let _ = fs::create_dir_all(dir);
+    }
+    if let Some(path) = path.as_ref() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(0);
+        let _ = fs::write(
+            path,
+            format!("===== VectorCraft Android launch @ unix {stamp} =====\n"),
+        );
+    }
+    let _ = STARTUP_LOG.set(path);
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown location".to_string());
+        let payload = if let Some(text) = info.payload().downcast_ref::<&str>() {
+            (*text).to_string()
+        } else if let Some(text) = info.payload().downcast_ref::<String>() {
+            text.clone()
+        } else {
+            "non-text panic payload".to_string()
+        };
+        note(&format!(
+            "PANIC at {location}: {payload}\n{}",
+            std::backtrace::Backtrace::force_capture()
+        ));
+        previous(info);
+    }));
+}
+
+unsafe extern "C" {
+    fn __system_property_get(name: *const std::ffi::c_char, value: *mut std::ffi::c_char) -> i32;
+}
+
+/// One read-only Android system property (`ro.build.version.sdk`, `ro.product.model`, ...).
+fn android_property(name: &str) -> String {
+    use std::ffi::{CStr, CString};
+    let Ok(name) = CString::new(name) else {
+        return String::new();
+    };
+    // PROP_VALUE_MAX on Android is 92 bytes, including the terminating NUL.
+    let mut value = [0 as std::ffi::c_char; 128];
+    // SAFETY: `name` is a valid NUL-terminated string and `value` is a writable buffer that is
+    // larger than PROP_VALUE_MAX; Android NUL-terminates whatever it writes.
+    let written = unsafe { __system_property_get(name.as_ptr(), value.as_mut_ptr()) };
+    if written <= 0 {
+        return String::new();
+    }
+    // SAFETY: the call above NUL-terminated the buffer.
+    unsafe { CStr::from_ptr(value.as_ptr()) }
+        .to_string_lossy()
+        .into_owned()
+}
 
 /// Cleared when the app shuts down, so a background watcher stops talking to the Activity.
 ///
@@ -736,6 +821,9 @@ struct VectorCraftAndroidApp {
     modifiers: egui::Modifiers,
     persist: Option<std::path::PathBuf>,
     persist_last: Option<std::time::Instant>,
+    /// How many frames egui has drawn; the first few are logged to the startup log so a black
+    /// window is told apart from a launch that dies before its first frame.
+    frames: u64,
     // Files the system asked us to open are staged by the Activity; this is the shared queue the
     // app's own inbox drains. `intent_warmup` skips the first couple of frames so the app has
     // finished its own start-up, and goes negative (stop polling) if the host has no intent bridge.
@@ -979,6 +1067,17 @@ impl Drop for VectorCraftAndroidApp {
 
 impl eframe::App for VectorCraftAndroidApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.frames = self.frames.saturating_add(1);
+        if self.frames <= 3 || self.frames == 30 || self.frames == 120 {
+            let screen = ctx.screen_rect();
+            note(&format!(
+                "frame {} drawn; pixels_per_point={} screen={}x{}",
+                self.frames,
+                ctx.pixels_per_point(),
+                screen.width(),
+                screen.height()
+            ));
+        }
         // Deliver picker answers before the app's own logic runs, so `picks::poll` resumes the
         // entry that asked in this same frame.
         poll_answers(&self.picks, &self.bridge, ctx);
@@ -1030,10 +1129,22 @@ impl eframe::App for VectorCraftAndroidApp {
 fn android_main(android_app: AndroidApp) {
     android_logger::init_once(
         android_logger::Config::default()
-            .with_max_level(log::LevelFilter::Info)
+            .with_max_level(log::LevelFilter::Debug)
             .with_tag("com.artcraft.vectorcraft"),
     );
-    log::info!("{SAF_BRIDGE_MARKER} ready; {ANDROID_SHELL_MARKER}; ARTCRAFT_ANDROID_NATIVE_IME_V1");
+    install_startup_log(&android_app);
+    let sdk = android_property("ro.build.version.sdk");
+    note(&format!(
+        "android_main: start; sdk={sdk} release={} model={} device={} hardware={} abi={}",
+        android_property("ro.build.version.release"),
+        android_property("ro.product.model"),
+        android_property("ro.product.device"),
+        android_property("ro.hardware"),
+        android_property("ro.product.cpu.abi"),
+    ));
+    note(&format!(
+        "{SAF_BRIDGE_MARKER} ready; {ANDROID_SHELL_MARKER}; ARTCRAFT_ANDROID_NATIVE_IME_V1"
+    ));
     egui_winit::android_activity::set_activity(android_app.activity_as_ptr());
     egui_winit::android_activity::set_vm(android_app.vm_as_ptr());
     install_persist_env(&android_app);
@@ -1041,70 +1152,109 @@ fn android_main(android_app: AndroidApp) {
     let bridge = match AndroidFileBridge::new(android_app.clone()) {
         Ok(bridge) => bridge,
         Err(error) => {
-            log::error!("VectorCraft Android startup failed: {error}");
+            note(&format!("VectorCraft Android startup failed: {error}"));
             return;
         }
     };
     if let Ok(dir) = bridge.files_dir() {
-        log::info!("VectorCraft app-private storage: {dir}");
+        note(&format!("VectorCraft app-private storage: {dir}"));
     }
     let picks = Arc::new(PickState::default());
     let intent_inbox: Inbox = Arc::new(Mutex::new(Vec::new()));
-    let options = eframe::NativeOptions {
+    // Android 9/10 devices (Mali-G71, Adreno 5xx) ship Vulkan 1.0 drivers that wgpu 30's Vulkan
+    // backend cannot use, while their GLES 3.x (EGL) path works. Ask for GLES explicitly there
+    // instead of leaving the choice to wgpu's adapter enumeration; newer systems keep Vulkan first
+    // with GLES as the fallback, exactly like the other ArtCraft adapters.
+    let sdk_version: u32 = sdk.parse().unwrap_or(0);
+    let mut backends = eframe::wgpu::Backends::VULKAN | eframe::wgpu::Backends::GL;
+    if (1..=29).contains(&sdk_version) {
+        backends = eframe::wgpu::Backends::GL;
+    }
+    note(&format!("wgpu backends: {backends:?}"));
+    let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("VectorCraft")
             .with_drag_and_drop(true),
+        renderer: eframe::Renderer::Wgpu,
         android_app: Some(android_app),
         ..Default::default()
     };
+    if let eframe::egui_wgpu::WgpuSetup::CreateNew(create) = &mut options.wgpu_options.wgpu_setup {
+        create.instance_descriptor.backends = backends;
+    }
     let app_bridge = bridge.clone_for_services();
     let app_picks = picks.clone();
     let app_intent_inbox = intent_inbox.clone();
-    let result = eframe::run_native(
-        "VectorCraft",
-        options,
-        Box::new(move |_cc| {
-            let mut app = VectorcraftApp::new(
-                Session::new(),
-                services(app_bridge.clone_for_services(), app_picks.clone(), app_intent_inbox.clone()),
-            );
-            if egui_winit::system_theme::system_theme() == Some(egui::Theme::Light) {
-                app.ui.brightness = vectorcraft_ui_egui::theme::Brightness::Light;
-            }
-            let persist = persist_dir(&app_bridge.app);
-            if let Some(dir) = &persist {
-                // Load the saved settings *first*, so the device's default UI scale below is not
-                // overwritten by `prefs_dialog::restore` (which rebuilds the prefs from the saved
-                // state, or from the defaults when there is none).
-                persist_load(&mut app, dir);
-                // VectorCraft draws its work on a canvas, so a high-density screen gets a *smaller*
-                // interface (75 %), not a larger one; every other screen keeps the app's own
-                // default, Auto. Applied once (`device_scale_first_time`), which covers a first
-                // launch and an upgrade from a build without this bootstrap; a user who sets the
-                // scale by hand keeps it, since the sidecar already says it was applied.
-                if device_is_high_density(&app_bridge.app) == Some(true) && device_scale_first_time(dir) {
-                    let _ = app.session.execute("prefs.set", &serde_json::json!({"key": "uiScaling", "value": 0.75}));
-                    persist_save(&mut app, dir);
+    note("starting eframe::run_native");
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        eframe::run_native(
+            "VectorCraft",
+            options,
+            Box::new(move |cc| {
+                note("eframe creator: start");
+                if let Some(render_state) = cc.wgpu_render_state.as_ref() {
+                    let info = render_state.adapter.get_info();
+                    let limits = render_state.device.limits();
+                    note(&format!(
+                        "GPU adapter: name={} backend={:?} type={:?} driver={} driver_info={}",
+                        info.name, info.backend, info.device_type, info.driver, info.driver_info
+                    ));
+                    note(&format!(
+                        "GPU limits: max_texture_2d={} max_buffer={} max_storage_buffers={}",
+                        limits.max_texture_dimension_2d,
+                        limits.max_buffer_size,
+                        limits.max_storage_buffers_per_shader_stage
+                    ));
+                } else {
+                    note("eframe creator: no wgpu render state");
                 }
-            }
-            Ok(Box::new(VectorCraftAndroidApp {
-                inner: app,
-                bridge: app_bridge.clone_for_services(),
-                picks: app_picks.clone(),
-                ime_text: String::new(),
-                ime_stale: None,
-                editing: false,
-                modifiers: egui::Modifiers::default(),
-                persist,
-                persist_last: None,
-                intent_inbox: app_intent_inbox.clone(),
-                intent_warmup: 2,
-                staged_seen: Vec::new(),
-                staged_sweep_at: Some(std::time::Instant::now() + std::time::Duration::from_secs(30)),
-            }))
-        }),
-    );
-    if let Err(error) = result {
-        log::error!("VectorCraft Android exited with an error: {error}");
+                note("eframe creator: building VectorcraftApp");
+                let mut app = VectorcraftApp::new(
+                    Session::new(),
+                    services(app_bridge.clone_for_services(), app_picks.clone(), app_intent_inbox.clone()),
+                );
+                if egui_winit::system_theme::system_theme() == Some(egui::Theme::Light) {
+                    app.ui.brightness = vectorcraft_ui_egui::theme::Brightness::Light;
+                }
+                let persist = persist_dir(&app_bridge.app);
+                if let Some(dir) = &persist {
+                    // Load the saved settings *first*, so the device's default UI scale below is not
+                    // overwritten by `prefs_dialog::restore` (which rebuilds the prefs from the saved
+                    // state, or from the defaults when there is none).
+                    persist_load(&mut app, dir);
+                    // VectorCraft draws its work on a canvas, so a high-density screen gets a *smaller*
+                    // interface (75 %), not a larger one; every other screen keeps the app's own
+                    // default, Auto. Applied once (`device_scale_first_time`), which covers a first
+                    // launch and an upgrade from a build without this bootstrap; a user who sets the
+                    // scale by hand keeps it, since the sidecar already says it was applied.
+                    if device_is_high_density(&app_bridge.app) == Some(true) && device_scale_first_time(dir) {
+                        let _ = app.session.execute("prefs.set", &serde_json::json!({"key": "uiScaling", "value": 0.75}));
+                        persist_save(&mut app, dir);
+                    }
+                }
+                note("eframe creator: VectorcraftApp built");
+                Ok(Box::new(VectorCraftAndroidApp {
+                    inner: app,
+                    bridge: app_bridge.clone_for_services(),
+                    picks: app_picks.clone(),
+                    ime_text: String::new(),
+                    ime_stale: None,
+                    editing: false,
+                    modifiers: egui::Modifiers::default(),
+                    persist,
+                    persist_last: None,
+                    frames: 0,
+                    intent_inbox: app_intent_inbox.clone(),
+                    intent_warmup: 2,
+                    staged_seen: Vec::new(),
+                    staged_sweep_at: Some(std::time::Instant::now() + std::time::Duration::from_secs(30)),
+                }))
+            }),
+        )
+    }));
+    match result {
+        Ok(Ok(())) => note("eframe::run_native returned: the app closed"),
+        Ok(Err(error)) => note(&format!("VectorCraft Android exited with an error: {error}")),
+        Err(_) => note("eframe::run_native panicked; see the PANIC entry above"),
     }
 }
