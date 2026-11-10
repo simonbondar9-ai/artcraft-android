@@ -1069,13 +1069,10 @@ impl eframe::App for VectorCraftAndroidApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.frames = self.frames.saturating_add(1);
         if self.frames <= 3 || self.frames == 30 || self.frames == 120 {
-            let screen = ctx.screen_rect();
             note(&format!(
-                "frame {} drawn; pixels_per_point={} screen={}x{}",
+                "frame {} drawn; pixels_per_point={}",
                 self.frames,
-                ctx.pixels_per_point(),
-                screen.width(),
-                screen.height()
+                ctx.pixels_per_point()
             ));
         }
         // Deliver picker answers before the app's own logic runs, so `picks::poll` resumes the
